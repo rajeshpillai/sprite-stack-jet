@@ -7,33 +7,34 @@
 <style>
   html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace}
   canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;touch-action:none;cursor:crosshair}
-  #hud{position:absolute;left:12px;top:10px;color:#d8f3ff;font-size:12px;line-height:1.6;pointer-events:none;text-shadow:0 1px 0 #000,0 0 6px #000}
-  #hud b{color:#7fffd4}
-  #cam{position:absolute;right:12px;top:10px;background:#000a;color:#d8f3ff;border:1px solid #d8f3ff55;padding:6px 10px;font:12px inherit;font-family:inherit;cursor:pointer}
+  #hint{position:absolute;left:0;right:0;bottom:10px;text-align:center;color:#e8f4ff;font-size:11px;letter-spacing:2px;text-transform:uppercase;pointer-events:none;text-shadow:0 1px 0 #000,0 0 6px #000;opacity:.85}
+  #alt{position:absolute;left:12px;top:10px;color:#e8f4ff;font-size:11px;letter-spacing:1px;pointer-events:none;text-shadow:0 1px 0 #000,0 0 6px #000;opacity:.8}
+  #loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9cc8ff;font-size:13px;letter-spacing:3px}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hud"></div>
-<button id="cam">VIEW: CHASE (C)</button>
+<div id="alt"></div>
+<div id="hint"></div>
+<div id="loading">GENERATING ISLANDS…</div>
 <script>
+'use strict';
 /* =====================================================================
-   SPRITE-STACK JET — pure Canvas 2D. No WebGL, no polygons, no 3D lib.
+   SPRITE-STACK JET v2 — pure Canvas 2D. No WebGL, no polygons, no 3D lib.
 
-   Three tricks do all the work:
-   1. SPRITE STACKING  – an object is a pile of 2D pixel slices. Draw
-      slice 0, then slice 1 a pixel "higher" on screen, etc. Rotate every
-      slice by the same angle and the pile reads as a 3D voxel model.
-   2. FAKE PERSPECTIVE – everything at height h is scaled by
-      s = F / (F + jetAltitude - h). Ground shrinks as you climb, the jet
-      (at its own altitude) is always s = 1.
-   3. MODE 7 FLOOR     – cockpit view: for each screen row below the
-      horizon, work out how far away that row is on the ground and sample
-      the world texture along it. SNES-era trick, a few lines of maths.
+   OVERHEAD VIEW  – the camera never rotates (north is always up), so every
+     static sprite stack (terrain terraces, trees, clouds) can be BAKED once
+     into a bitmap: layer L is drawn L pixels higher than layer L-1. Only
+     the jet is stacked live every frame, because it turns and rolls.
+   ALTITUDE       – things at height h are scaled by s = Z·F / (F + alt − h).
+   COCKPIT VIEW   – a Mode 7 floor: each screen row below the horizon is a
+     line on the ground at distance d = camHeight·focal / (row − horizon),
+     sampled from a flat colour map. Clouds are distance-scaled billboards.
+     The cockpit and its instruments are drawn with plain rects and arcs.
    ===================================================================== */
 
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
-const hud = document.getElementById('hud'), camBtn = document.getElementById('cam');
+const hintEl = document.getElementById('hint'), altEl = document.getElementById('alt');
 
 // ---------- helpers ----------
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
@@ -46,412 +47,529 @@ function hash(x, y){let h=(x*374761393+y*668265263)|0;h=Math.imul(h^(h>>>13),127
 const pack = (c, m = 1) => (255 << 24) | (Math.min(255, c[2] * m) << 16) | (Math.min(255, c[1] * m) << 8) | Math.min(255, c[0] * m);
 const rgb = (c, a = 1) => `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`;
 
-// ---------- screen: tiny low-res buffer, CSS scales it up pixelated ----------
-let W = 384, H = 216, CX, CY;
+// ---------- constants ----------
+const WS = 1536, NPX = WS * WS;     // world wraps every WS units
+const NL = 14;                      // terrain levels
+const F = 2000, Z = 1.6;            // perspective: s = Z*F/(F + alt - h)
+const PR = 2000;                    // planet radius for the view from space
+const MAX_ALT = 60000, MIN_ALT = 15;
+const SUN = [-0.13, 0.22];          // shadow direction per unit of height
+const K7 = 0.12;                    // cockpit: vertical scale of altitude
+const JS = 1.3;                     // jet: screen pixels per voxel
+
+// ---------- screen ----------
+let W = 570, H = 320, CX, CY;
 const m7 = document.createElement('canvas'), m7c = m7.getContext('2d');
-let m7img, m7buf;
+const ov = document.createElement('canvas'), ovc = ov.getContext('2d');
+let m7img, m7buf, CK = {};
 function resize(){
-  H = 216;
-  W = clamp(Math.round(H * innerWidth / innerHeight), 200, 560);
+  H = 320; W = clamp(Math.round(H * innerWidth / innerHeight), 260, 760);
   cv.width = W; cv.height = H; m7.width = W; m7.height = H;
   m7img = m7c.createImageData(W, H); m7buf = new Uint32Array(m7img.data.buffer);
-  CX = W / 2; CY = H * 0.62;
+  CX = W / 2; CY = H / 2;
+  buildCockpit();
 }
-addEventListener('resize', resize); resize();
 
-// ---------- world constants ----------
-const WS = 1536;          // world wraps every WS units (also heightmap size)
-const LH = 3;             // world height of one island layer
-const F = 300;            // "focal" distance of the chase camera above the jet
-const TILT = 0.55;        // screen-up shift per unit of height (the stacking offset)
-const PR = 6000;          // planet radius, for the view from space
-const CLOUD_H = 900;      // cloud deck altitude
-const MAX_ALT = 12000;
+/* =====================================================================
+   1. WORLD: tileable fbm height -> levels -> two maps
+      flat32  : plain colour map (cockpit Mode 7 + radar)
+      over32  : same map with every terrain layer & tree BAKED as a stack
+   ===================================================================== */
+const rnd = mulberry32(20261116);
+let lvl, flat32, overheadPattern, sea;
+const OCEAN = [[104,200,240],[74,158,230],[54,124,210],[44,104,194],[36,86,172]];
+const LAND = [null,[238,222,162],[166,224,92],[150,214,80],[136,206,72],[118,196,64],[102,184,58],[90,172,54],[78,156,50],[66,142,48],
+              [140,132,120],[126,118,108],[152,146,134],[170,164,152],[190,184,174]];
+const TREE = [[26,82,38],[34,100,42],[46,120,48],[62,140,56],[86,164,66]];
 
-// ---------- 1. ISLANDS: heightmap -> texture + stacked slices ----------
-const rnd = mulberry32(7);
-const hm = new Uint8Array(WS * WS);        // 0 deep, 1 shallow, 2+ land level
-const hidx = (x, y) => (((y % WS) + WS) % WS) * WS + (((x % WS) + WS) % WS);
-const islands = [];
-for (let i = 0; i < 30; i++){
-  const r = 16 + Math.pow(rnd(), 1.5) * 52;
-  islands.push({ x: Math.round(rnd() * WS), y: Math.round(rnd() * WS), r,
-    maxL: Math.min(17, 3 + Math.round(r / 3.6)), ph: [rnd()*6.28, rnd()*6.28, rnd()*6.28] });
-}
-for (const isl of islands){
-  const R = Math.ceil(isl.r * 1.6 + 6);
-  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++){
-    const d = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
-    const rr = isl.r * (1 + 0.2*Math.sin(3*ang + isl.ph[0]) + 0.12*Math.sin(5*ang + isl.ph[1]) + 0.07*Math.sin(9*ang + isl.ph[2]));
-    const t = 1 - d / rr;
-    let v;
-    if (t > 0) v = clamp(2 + Math.floor((Math.pow(t, 0.75) + (hash(dx + isl.x, dy + isl.y) - 0.5) * 0.06) * (isl.maxL - 1)), 2, isl.maxL);
-    else if (t > -0.3) v = 1; else continue;
-    const k = hidx(isl.x + dx, isl.y + dy);
-    if (v > hm[k]) hm[k] = v;
-  }
-}
-const DEEP = [29, 110, 143], SHALLOW = [70, 172, 184];
-function landColor(L){
-  if (L <= 2) return [236, 219, 168];
-  if (L === 3) return [214, 194, 140];
-  if (L <= 5) return [128, 202, 84];
-  if (L <= 8) return [88, 172, 66];
-  if (L <= 11) return [58, 135, 56];
-  if (L <= 14) return [128, 116, 102];
-  return [236, 240, 245];
-}
-// flat colour texture of the whole world (used by chase ground + Mode 7)
-const tex = document.createElement('canvas'); tex.width = tex.height = WS;
-const tctx = tex.getContext('2d'), timg = tctx.createImageData(WS, WS), t32 = new Uint32Array(timg.data.buffer);
-for (let y = 0; y < WS; y++) for (let x = 0; x < WS; x++){
-  const v = hm[y * WS + x], n = hash(x, y);
-  let c;
-  if (v === 0) c = pack(DEEP, 0.95 + 0.07 * n);
-  else if (v === 1) c = pack(SHALLOW, 0.95 + 0.07 * n);
-  else {
-    const lower = hm[hidx(x + 1, y)] < v || hm[hidx(x, y + 1)] < v;
-    c = pack(landColor(v), (lower ? 0.8 : 1) * (0.92 + 0.1 * n));
-  }
-  t32[y * WS + x] = c;
-}
-tctx.putImageData(timg, 0, 0);
-const groundPattern = ctx.createPattern(tex, 'repeat');
-
-// Each island becomes a stack of slice canvases: slice L = all pixels with level >= L.
-for (const isl of islands){
-  isl.layers = [];
-  const R = Math.ceil(isl.r * 1.4 + 4);
-  for (let L = 2; L <= isl.maxL; L++){
-    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++)
-      if (hm[hidx(isl.x + dx, isl.y + dy)] >= L){ if (dx < x0) x0 = dx; if (dx > x1) x1 = dx; if (dy < y0) y0 = dy; if (dy > y1) y1 = dy; }
-    if (x0 > x1) break;
-    const w = x1 - x0 + 1, h = y1 - y0 + 1;
-    const c = document.createElement('canvas'); c.width = w; c.height = h;
-    const g = c.getContext('2d'), id = g.createImageData(w, h), b = new Uint32Array(id.data.buffer);
-    const col = landColor(L);
-    for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++){
-      const wx = isl.x + x0 + xx, wy = isl.y + y0 + yy;
-      if (hm[hidx(wx, wy)] < L) continue;
-      const edge = hm[hidx(wx+1,wy)] < L || hm[hidx(wx-1,wy)] < L || hm[hidx(wx,wy+1)] < L || hm[hidx(wx,wy-1)] < L;
-      b[yy * w + xx] = pack(col, edge ? 0.68 : 0.9 + 0.12 * hash(wx, wy));
+function fbm(periods, gain){
+  const out = new Float32Array(NPX); let amp = 1, tot = 0;
+  for (const p of periods){
+    const lat = new Float32Array(p * p); for (let i = 0; i < lat.length; i++) lat[i] = rnd();
+    const cell = WS / p;
+    for (let y = 0; y < WS; y++){
+      const fy = y / cell, iy = fy | 0, ty = fy - iy, sy = ty * ty * (3 - 2 * ty), y0 = (iy % p) * p, y1 = ((iy + 1) % p) * p;
+      for (let x = 0; x < WS; x++){
+        const fx = x / cell, ix = fx | 0, tx = fx - ix, sx = tx * tx * (3 - 2 * tx), x0 = ix % p, x1 = (ix + 1) % p;
+        const a = lat[y0 + x0], b = lat[y0 + x1], c = lat[y1 + x0], d = lat[y1 + x1];
+        const top = a + (b - a) * sx, bot = c + (d - c) * sx;
+        out[y * WS + x] += amp * (top + (bot - top) * sy);
+      }
     }
-    g.putImageData(id, 0, 0);
-    isl.layers.push({ c, ox: x0, oy: y0, h: (L - 1) * LH });
+    tot += amp; amp *= gain;
+  }
+  for (let i = 0; i < NPX; i++) out[i] /= tot;
+  return out;
+}
+const idx = (x, y) => (((y % WS) + WS) % WS) * WS + (((x % WS) + WS) % WS);
+
+function buildWorld(){
+  const h = fbm([6, 12, 24, 48, 96, 192], 0.5);
+  const forest = fbm([24, 48], 0.6);
+  // pick sea level so ~24% is land
+  const sample = []; for (let i = 0; i < 40000; i++) sample.push(h[(rnd() * NPX) | 0]);
+  sample.sort((a, b) => a - b);
+  sea = sample[(sample.length * 0.76) | 0];
+  const hTop = sample[(sample.length * 0.9995) | 0], hLow = sample[(sample.length * 0.02) | 0];
+
+  lvl = new Uint8Array(NPX);
+  const depth = new Float32Array(NPX);
+  for (let i = 0; i < NPX; i++){
+    if (h[i] >= sea) lvl[i] = clamp(1 + Math.floor((h[i] - sea) / (hTop - sea) * NL), 1, NL);
+    else depth[i] = (sea - h[i]) / (sea - hLow);
+  }
+
+  flat32 = new Uint32Array(NPX);
+  const over = new Uint32Array(NPX);
+  // ocean: depth bands, wave streaks, surf
+  for (let y = 0; y < WS; y++) for (let x = 0; x < WS; x++){
+    const i = y * WS + x; if (lvl[i]) continue;
+    const n = hash(x, y), d = depth[i] + (n - 0.5) * 0.03;
+    const band = d < 0.035 ? 0 : d < 0.09 ? 1 : d < 0.2 ? 2 : d < 0.42 ? 3 : 4;
+    let c = pack(OCEAN[band], 0.97 + 0.05 * n);
+    const near1 = lvl[idx(x+1,y)] || lvl[idx(x-1,y)] || lvl[idx(x,y+1)] || lvl[idx(x,y-1)];
+    const near2 = !near1 && (lvl[idx(x+2,y)] || lvl[idx(x-2,y)] || lvl[idx(x,y+2)] || lvl[idx(x,y-2)]);
+    if (near1 && n > 0.2) c = pack([242, 249, 255]);
+    else if (near2 && n > 0.45) c = pack([196, 232, 252]);
+    flat32[i] = over[i] = c;
+  }
+  for (let y = 0; y < WS; y++) for (let x = 0; x < WS; x++){         // vertical white wave streaks
+    const i = y * WS + x;
+    if (lvl[i] || depth[i] < 0.04 || hash(x * 3 + 1, y * 7 + 5) > 0.011) continue;
+    const c = pack(hash(x, y + 9) > 0.5 ? [236, 246, 255] : [190, 222, 250]);
+    for (let k = 0; k < 3; k++){ const j = idx(x, y + k); if (!lvl[j]) flat32[j] = over[j] = c; }
+  }
+  // flat land (contour line wherever a neighbour is a level lower)
+  for (let y = 0; y < WS; y++) for (let x = 0; x < WS; x++){
+    const i = y * WS + x, L = lvl[i]; if (!L) continue;
+    const edge = lvl[idx(x+1,y)] < L || lvl[idx(x-1,y)] < L || lvl[idx(x,y+1)] < L || lvl[idx(x,y-1)] < L;
+    flat32[i] = pack(LAND[L], edge ? 0.76 : 0.95 + 0.07 * hash(x, y));
+  }
+  // BAKED STACK: draw layer 1..NL, each shifted up (L-1) px; south-facing cliffs darker
+  for (let L = 1; L <= NL; L++){
+    const off = L - 1, col = LAND[L];
+    for (let y = 0; y < WS; y++){
+      const ty = ((y - off) % WS + WS) % WS;
+      for (let x = 0; x < WS; x++){
+        const i = y * WS + x; if (lvl[i] < L) continue;
+        const south = lvl[idx(x, y + 1)] < L;
+        const edge = south || lvl[idx(x+1,y)] < L || lvl[idx(x-1,y)] < L || lvl[idx(x,y-1)] < L;
+        over[ty * WS + x] = pack(col, south ? 0.62 : edge ? 0.76 : 0.95 + 0.07 * hash(x, y));
+      }
+    }
+  }
+  // trees: a tiny 5-layer stack, baked in row order so nearer trees overlap farther ones
+  const treeR = [2.2, 3.3, 3.2, 2.6, 1.6], tree = [];
+  for (let k = 0; k < 5; k++){
+    const cy = 7 - k;
+    for (let py = 0; py < 11; py++) for (let px = 0; px < 7; px++){
+      const dx = px - 3, dy = py - cy;
+      if (dx * dx + dy * dy <= treeR[k] * treeR[k]){
+        const r2 = treeR[k] - 0.9, edge = dx * dx + dy * dy > r2 * r2;
+        tree.push([px, py, pack(TREE[k], edge ? 0.8 : 1 + (dx < 0 && dy < 0 ? 0.12 : 0))]);
+      }
+    }
+  }
+  for (let gy = 0; gy < WS; gy += 5) for (let gx = 0; gx < WS; gx += 5){
+    const x = gx + ((hash(gx, gy) * 4) | 0), y = gy + ((hash(gy, gx) * 4) | 0), i = idx(x, y), L = lvl[i];
+    if (L < 2 || L > 9 || forest[i] < 0.56 || hash(x + 3, y) < 0.3) continue;
+    for (const [px, py, c] of tree) over[idx(x - 3 + px, y - 9 - (L - 1) + py)] = c;
+    for (let k = 0; k < 4; k++) flat32[idx(x + (k & 1), y + (k >> 1))] = pack(TREE[1 + (k === 0 ? 2 : 0)]);
+  }
+  const oc = document.createElement('canvas'); oc.width = oc.height = WS;
+  const og = oc.getContext('2d'), oimg = og.createImageData(WS, WS);
+  new Uint32Array(oimg.data.buffer).set(over); og.putImageData(oimg, 0, 0);
+  overheadPattern = ctx.createPattern(oc, 'repeat');
+}
+const lvlAt = (x, y) => lvl[idx(Math.floor(x), Math.floor(y))];
+
+/* =====================================================================
+   2. CLOUDS: union of spheres -> baked top-down stack + shadow + side billboard
+   ===================================================================== */
+const clouds = [];
+function buildClouds(){
+  for (let n = 0; n < 120; n++){
+    const sp = [], cnt = 3 + ((rnd() * 5) | 0), ax = rnd() * Math.PI;
+    for (let j = 0; j < cnt; j++){
+      const t = cnt === 1 ? 0 : j / (cnt - 1) - 0.5, r = 7 + rnd() * 13 * (1 - Math.abs(t));
+      sp.push({ x: Math.cos(ax) * t * cnt * 9 + (rnd() - 0.5) * 8, y: Math.sin(ax) * t * cnt * 9 + (rnd() - 0.5) * 8, r, z: r * 0.55 });
+    }
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, zm = 0;
+    for (const s of sp){ x0 = Math.min(x0, s.x - s.r); x1 = Math.max(x1, s.x + s.r); y0 = Math.min(y0, s.y - s.r); y1 = Math.max(y1, s.y + s.r); zm = Math.max(zm, s.z + s.r); }
+    x0 = Math.floor(x0) - 1; y0 = Math.floor(y0) - 1; zm = Math.ceil(zm);
+    const w = Math.ceil(x1) - x0 + 2, h = Math.ceil(y1) - y0 + 2;
+    // per pixel z-range of the cloud column
+    const zlo = new Float32Array(w * h).fill(1e9), zhi = new Float32Array(w * h).fill(-1);
+    for (let py = 0; py < h; py++) for (let px = 0; px < w; px++){
+      for (const s of sp){
+        const dx = px + x0 - s.x, dy = py + y0 - s.y, d2 = dx * dx + dy * dy;
+        if (d2 < s.r * s.r){ const e = Math.sqrt(s.r * s.r - d2); const k = py * w + px;
+          zlo[k] = Math.min(zlo[k], Math.max(0, s.z - e)); zhi[k] = Math.max(zhi[k], s.z + e); }
+      }
+    }
+    const inside = (px, py, z) => px >= 0 && py >= 0 && px < w && py < h && z >= zlo[py * w + px] && z <= zhi[py * w + px];
+    const top = document.createElement('canvas'); top.width = w; top.height = h + zm;
+    const tg = top.getContext('2d'), ti = tg.createImageData(w, h + zm), tb = new Uint32Array(ti.data.buffer);
+    const shadow = document.createElement('canvas'); shadow.width = w; shadow.height = h;
+    const sg = shadow.getContext('2d'); sg.fillStyle = 'rgb(12,34,96)';
+    for (let z = 0; z <= zm; z++){
+      const t = Math.pow(z / zm, 0.7), col = mixc([164, 188, 222], [255, 255, 255], t);
+      for (let py = 0; py < h; py++) for (let px = 0; px < w; px++){
+        if (!inside(px, py, z)) continue;
+        const edge = !inside(px+1,py,z) || !inside(px-1,py,z) || !inside(px,py+1,z) || !inside(px,py-1,z);
+        tb[(py + zm - z) * w + px] = pack(col, edge ? 0.9 : 1);
+      }
+    }
+    tg.putImageData(ti, 0, 0);
+    for (let py = 0; py < h; py++) for (let px = 0; px < w; px++) if (zhi[py * w + px] >= 0) sg.fillRect(px, py, 1, 1);
+    // side billboard for the cockpit
+    const bb = document.createElement('canvas'); bb.width = w; bb.height = zm + 2;
+    const bg = bb.getContext('2d'), bi = bg.createImageData(w, zm + 2), bbuf = new Uint32Array(bi.data.buffer);
+    const side = (u, v) => sp.some(s => { const dx = u + x0 - s.x, dz = v - s.z; return dx * dx + dz * dz < s.r * s.r && v >= 0; });
+    for (let v = 0; v <= zm; v++) for (let u = 0; u < w; u++){
+      if (!side(u, v)) continue;
+      const edge = !side(u, v + 1) || !side(u + 1, v) || !side(u - 1, v);
+      bbuf[(zm - v + 1) * w + u] = pack(mixc([170, 192, 224], [255, 255, 255], Math.pow(v / zm, 0.6)), edge ? 0.92 : 1);
+    }
+    bg.putImageData(bi, 0, 0);
+    clouds.push({ x: rnd() * WS, y: rnd() * WS, h: 650 + rnd() * 380, x0, y0, w, hh: h, zm, top, shadow, bb });
   }
 }
 
-// ---------- 2. THE JET: a voxel function sliced into 9 layers ----------
-const BODY = [172, 182, 194], BODY_TOP = [204, 213, 222], RED = [205, 62, 52];
+/* =====================================================================
+   3. THE JET: a voxel function sliced into 8 layers, stacked live
+   ===================================================================== */
+const GM = [58, 62, 72], GM2 = [84, 90, 102], DK = [36, 38, 44], OR = [226, 88, 44], CYAN = [92, 218, 238];
 function jetVox(x, y, z){
   const ax = Math.abs(x);
-  if (y >= 10 && y <= 11 && ax <= 1 && (z === 2 || z === 3)) return [62, 64, 72];       // nozzle
-  const bw = y < -9 ? 0 : y < -6 ? 1 : y <= 9 ? 2 : -1;                                   // fuselage half-width
-  const zlo = y < -9 ? 2 : 1, zhi = y < -9 ? 3 : 4;
-  if (bw >= 0 && ax <= bw && z >= zlo && z <= zhi) return y <= -11 ? RED : z === zhi ? BODY_TOP : BODY;
-  if (z === 5 && y >= -8 && y <= -3 && ax <= 1 && !(ax === 1 && (y === -8 || y === -3))) return [110, 222, 255]; // canopy
-  if (z === 2 && y >= -3 && y <= 8){                                                       // swept delta wing
-    const span = 2 + (y + 3) * 0.8;
-    if (ax <= span) return ax >= span - 1.5 ? RED : [150, 160, 172];
-  }
-  if (z === 3 && y >= 7 && y <= 11 && ax >= 3 && ax <= 2 + (y - 7) * 1.4) return [150, 160, 172]; // tailplane
-  if (x === 0 && z >= 5 && z <= 8 && y >= 3 + (z - 5) * 1.5 && y <= 10) return z === 8 ? RED : [160, 170, 182]; // fin
+  if (y >= 11 && y <= 12 && ax >= 1 && ax <= 2 && z >= 2 && z <= 3) return [28, 28, 32];        // twin nozzles
+  const bw = y < -10 ? 0 : y < -7 ? 1 : y < -1 ? 2 : y <= 10 ? 3 : -1;                           // fuselage
+  const zlo = y < -10 ? 2 : 1, zhi = y < -10 ? 3 : 4;
+  if (bw >= 0 && ax <= bw && z >= zlo && z <= zhi) return y <= -12 ? DK : z === zhi && ax <= 1 ? GM2 : GM;
+  if (z >= 2 && z <= 3 && ax === 3 && y >= -6 && y <= -2) return OR;                              // intakes
+  if (z === 5 && y >= -9 && y <= -4 && ax <= 1 && !(ax === 1 && (y === -9 || y === -4))) return CYAN; // canopy
+  if (z === 2 && y >= -4 && y <= 7){ const span = 3 + (y + 4) * 0.75;                             // delta wing
+    if (ax <= span) return ax >= span - 1.2 ? OR : ax > 8 ? GM2 : GM; }
+  if (z === 2 && y >= 8 && y <= 12 && ax >= 4 && ax <= 3 + (y - 7) * 1.1) return GM2;              // tailplanes
+  if (ax === 3 && z >= 5 && z <= 7 && y >= 4 + (z - 4) && y <= 10) return z === 7 ? OR : GM2;      // twin fins
   return null;
 }
-const JZ = 9, jetLayers = [];
-const jetShadow = document.createElement('canvas'); jetShadow.width = 21; jetShadow.height = 25;
-const shg = jetShadow.getContext('2d'); shg.fillStyle = '#000';
-for (let z = 0; z < JZ; z++){
-  const c = document.createElement('canvas'); c.width = 21; c.height = 25;
-  const g = c.getContext('2d'), id = g.createImageData(21, 25), b = new Uint32Array(id.data.buffer);
-  for (let y = -12; y <= 12; y++) for (let x = -10; x <= 10; x++){
-    const col = jetVox(x, y, z); if (!col) continue;
-    const edge = !jetVox(x+1,y,z) || !jetVox(x-1,y,z) || !jetVox(x,y+1,z) || !jetVox(x,y-1,z);
-    b[(y + 12) * 21 + (x + 10)] = pack(col, (edge ? 0.78 : 1) * (0.75 + 0.3 * z / JZ));
-    shg.fillRect(x + 10, y + 12, 1, 1);
+const JZ = 8, JW = 23, JH = 27, jetLayers = [];
+const jetSil = document.createElement('canvas'); jetSil.width = JW; jetSil.height = JH;
+const jetSilG = document.createElement('canvas'); jetSilG.width = JW; jetSilG.height = JH;
+(function buildJet(){
+  const sg = jetSil.getContext('2d'), gg = jetSilG.getContext('2d');
+  sg.fillStyle = 'rgb(12,34,96)'; gg.fillStyle = '#7dff9a';
+  for (let z = 0; z < JZ; z++){
+    const c = document.createElement('canvas'); c.width = JW; c.height = JH;
+    const g = c.getContext('2d'), id = g.createImageData(JW, JH), b = new Uint32Array(id.data.buffer);
+    for (let y = -13; y <= 13; y++) for (let x = -11; x <= 11; x++){
+      const col = jetVox(x, y, z); if (!col) continue;
+      const edge = !jetVox(x+1,y,z) || !jetVox(x-1,y,z) || !jetVox(x,y+1,z) || !jetVox(x,y-1,z);
+      b[(y + 13) * JW + (x + 11)] = pack(col, (edge ? 0.75 : 1) * (0.78 + 0.32 * z / (JZ - 1)));
+      sg.fillRect(x + 11, y + 13, 1, 1); gg.fillRect(x + 11, y + 13, 1, 1);
+    }
+    g.putImageData(id, 0, 0); jetLayers.push(c);
   }
-  g.putImageData(id, 0, 0);
-  jetLayers.push(c);
-}
+})();
 
-// ---------- clouds & stars ----------
-const clouds = [];
-for (let i = 0; i < 45; i++){
-  const puffs = [], n = 4 + (rnd() * 4 | 0);
-  for (let j = 0; j < n; j++) puffs.push({ ox: (rnd() - 0.5) * 70, oy: (rnd() - 0.5) * 40, r: 12 + rnd() * 20 });
-  clouds.push({ x: rnd() * WS, y: rnd() * WS, puffs });
-}
-const stars = [];
-for (let i = 0; i < 260; i++) stars.push({ az: rnd() * Math.PI * 2, el: Math.asin(rnd()) * 1.2, u: rnd() * 2 - 1, v: rnd() * 2 - 1, b: 0.4 + rnd() * 0.6 });
-
-// ---------- state ----------
-const S = {
-  x: islands[0].x + 80, y: islands[0].y + 120, alt: 40, vz: 0, speed: 70,
-  a: 0, camA: 0, turn: 0, bank: 0, rollT: 0, rollDir: 1, view: 'chase', t: 0
-};
-const trail = [];
+// ---------- state & input ----------
+const S = { x: 0, y: 0, alt: 1300, vz: 0, speed: 120, a: 0.6, turn: 0, bank: 0, pitch: 0,
+  rollT: 0, rollDir: 1, view: 'overhead', t: 0, camX: 0, camY: 0, thrust: false };
+const trailL = [], trailR = [], stars = [];
+for (let i = 0; i < 320; i++) stars.push({ az: rnd() * Math.PI * 2, el: Math.asin(rnd()) * 1.3, u: rnd(), v: rnd(), b: 0.35 + rnd() * 0.65 });
 const keys = {};
-let pointerX = 0, pointerActive = false, down = false, downT = 0;
-
+let px = 0, py = 0, pActive = false, down = false, downT = 0;
 addEventListener('keydown', e => {
-  keys[e.code] = true;
-  if (e.code === 'KeyC' || e.code === 'KeyV') toggleView();
+  if (keys[e.code]) return; keys[e.code] = true;
+  if (e.code === 'Space' || e.code === 'KeyC'){ e.preventDefault(); S.view = S.view === 'overhead' ? 'cockpit' : 'overhead'; }
   if (e.code === 'KeyR' || e.code === 'KeyQ') startRoll();
-  if (e.code === 'Space') e.preventDefault();
 });
 addEventListener('keyup', e => keys[e.code] = false);
-cv.addEventListener('pointerdown', e => { down = true; downT = performance.now(); setPointer(e); cv.setPointerCapture(e.pointerId); });
-cv.addEventListener('pointermove', setPointer);
+cv.addEventListener('pointerdown', e => { down = true; downT = performance.now(); setP(e); cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', setP);
 cv.addEventListener('pointerup', () => { if (down && performance.now() - downT < 180) startRoll(); down = false; });
 cv.addEventListener('pointercancel', () => down = false);
-camBtn.addEventListener('click', toggleView);
-function setPointer(e){ pointerX = clamp((e.clientX / innerWidth) * 2 - 1, -1, 1); pointerActive = true; }
-function toggleView(){ S.view = S.view === 'chase' ? 'cockpit' : 'chase'; camBtn.textContent = `VIEW: ${S.view.toUpperCase()} (C)`; }
+function setP(e){ const r = cv.getBoundingClientRect(); px = (e.clientX - r.left) / r.width * W; py = (e.clientY - r.top) / r.height * H; pActive = true; }
 function startRoll(){ if (S.rollT <= 0){ S.rollT = 0.0001; S.rollDir = S.turn >= 0 ? 1 : -1; } }
-
-function groundHeight(x, y){ const v = hm[hidx(Math.floor(x), Math.floor(y))]; return v >= 2 ? (v - 1) * LH : 0; }
+const groundH = (x, y) => { const L = lvlAt(x, y); return L ? L * 8 : 0; };
 
 // ---------- update ----------
 function update(dt){
   S.t += dt;
-  let steer = pointerActive ? (Math.abs(pointerX) < 0.06 ? 0 : pointerX) : 0;
+  const fwd = [Math.sin(S.a), -Math.cos(S.a)];
+  // steering
+  let steer = 0, climb = 0;
+  if (S.view === 'overhead'){
+    if (pActive){
+      const jx = CX + (S.x - S.camX) * Z, jy = CY + (S.y - S.camY) * Z;   // jet on screen
+      const dx = px - jx, dy = py - jy;
+      if (dx * dx + dy * dy > 400) steer = clamp(wrapPi(Math.atan2(dx, -dy) - S.a) * 1.6, -1, 1);
+    }
+    climb = S.thrust ? 0.8 : clamp((1300 - S.alt) / 1500, -0.25, 0.25);   // idle: drift back to cruise
+  } else if (pActive){
+    const nx = px / W * 2 - 1, ny = py / H * 2 - 1;
+    steer = Math.abs(nx) < 0.05 ? 0 : clamp(nx * 1.3, -1, 1);
+    climb = Math.abs(ny) < 0.06 ? 0 : clamp(-ny * 1.4, -1, 1);
+  }
   if (keys.ArrowLeft || keys.KeyA) steer = -1;
   if (keys.ArrowRight || keys.KeyD) steer = 1;
+  if (keys.ArrowUp || keys.KeyW) climb = 1;
+  if (keys.ArrowDown || keys.KeyS) climb = -1;
+
   S.turn = lerp(S.turn, steer, Math.min(1, dt * 4));
-  S.a += S.turn * 1.5 * dt;
-  S.camA += wrapPi(S.a - S.camA) * Math.min(1, dt * 2.5);   // camera lags -> you see the jet yaw
-  S.bank = lerp(S.bank, S.turn * 0.75, Math.min(1, dt * 5));
+  S.a += S.turn * 1.6 * dt;
+  S.bank = lerp(S.bank, S.turn * 0.8, Math.min(1, dt * 5));
 
-  const thrust = keys.Space || keys.ArrowUp || keys.KeyW || (down && performance.now() - downT >= 180);
-  S.thrust = thrust;
-  S.speed = lerp(S.speed, thrust ? 170 : 75, Math.min(1, dt * 1.5));
-  const targetVz = thrust ? 120 + S.alt * 0.7 : -(50 + S.alt * 0.3);
-  S.vz = lerp(S.vz, targetVz, Math.min(1, dt * 1.8));
-  S.alt = clamp(S.alt + S.vz * dt, 0, MAX_ALT);
-  const minAlt = groundHeight(S.x, S.y) + 12;
-  if (S.alt < minAlt){ S.alt = lerp(S.alt, minAlt, 0.35); S.vz = Math.max(S.vz, 0); }
+  S.thrust = keys.ShiftLeft || keys.ShiftRight || (down && performance.now() - downT >= 180);
+  S.speed = lerp(S.speed, S.thrust ? 240 : 120, Math.min(1, dt * 1.4));
+  const rate = 260 + S.alt * 0.5;
+  S.vz = lerp(S.vz, climb * rate, Math.min(1, dt * 2));
+  S.pitch = lerp(S.pitch, clamp(S.vz / rate, -1, 1) * 0.45, Math.min(1, dt * 4));
+  S.alt = clamp(S.alt + S.vz * dt, MIN_ALT, MAX_ALT);
+  const floor = groundH(S.x, S.y) + MIN_ALT;
+  if (S.alt < floor){ S.alt = lerp(S.alt, floor, 0.3); S.vz = Math.max(0, S.vz); }
 
-  S.x = ((S.x + Math.sin(S.a) * S.speed * dt) % WS + WS) % WS;
-  S.y = ((S.y - Math.cos(S.a) * S.speed * dt) % WS + WS) % WS;
+  S.x += fwd[0] * S.speed * dt; S.y += fwd[1] * S.speed * dt;
+  S.camX = lerp(S.camX, S.x + fwd[0] * S.speed * 0.35, Math.min(1, dt * 3));
+  S.camY = lerp(S.camY, S.y + fwd[1] * S.speed * 0.35, Math.min(1, dt * 3));
 
   if (S.rollT > 0){ S.rollT += dt / 0.8; if (S.rollT >= 1) S.rollT = 0; }
   const e = S.rollT > 0 ? (1 - Math.cos(S.rollT * Math.PI)) / 2 : 0;
   S.roll = S.bank + e * Math.PI * 2 * S.rollDir;
 
-  if (thrust && Math.random() < 0.9)
-    trail.push({ x: S.x - Math.sin(S.a) * 16, y: S.y + Math.cos(S.a) * 16, h: S.alt, life: 1.3 });
-  for (let i = trail.length - 1; i >= 0; i--){ trail[i].life -= dt; if (trail[i].life <= 0) trail.splice(i, 1); }
-
-  // day/night cycle (90 s)
-  S.sunEl = Math.sin((S.t / 90 + 0.12) * Math.PI * 2);
+  // wingtip contrails (world positions)
+  const sc = JS / Z, lat = 10.5 * sc * Math.cos(S.roll), back = 6 * sc;
+  const rx = Math.cos(S.a), ry = Math.sin(S.a);
+  for (const [arr, sgn] of [[trailL, -1], [trailR, 1]]){
+    arr.push({ x: S.x + rx * lat * sgn - fwd[0] * back, y: S.y + ry * lat * sgn - fwd[1] * back, h: S.alt, t: S.t });
+    while (arr.length && S.t - arr[0].t > 3.5) arr.shift();
+  }
+  S.sunEl = Math.sin((S.t / 300 + 0.2) * Math.PI * 2);
   S.day = smooth(-0.15, 0.25, S.sunEl);
   S.sunset = clamp(1 - Math.abs(S.sunEl) / 0.3, 0, 1);
 }
 
-// world (x,y,h) -> screen, for the chase camera
-function proj(wx, wy, h, wrap = true){
-  let dx = wx - S.x, dy = wy - S.y;
-  if (wrap){ dx = ((dx % WS) + WS * 1.5) % WS - WS / 2; dy = ((dy % WS) + WS * 1.5) % WS - WS / 2; }
-  const c = Math.cos(S.camA), s0 = Math.sin(S.camA);
-  const rx = dx * c + dy * s0, ry = -dx * s0 + dy * c;   // rotate so jet heading is screen-up
-  const depth = F + S.alt - h;
-  if (depth < F * 0.1) return null;                     // above the camera
-  const s = F / depth;
-  return { x: CX + rx * s, y: CY + ry * s - h * TILT * s, s, ry };
+// ---------- overhead projection (camera north-up) ----------
+const wrapD = d => { d %= WS; if (d > WS / 2) d -= WS; if (d < -WS / 2) d += WS; return d; };
+function proj(wx, wy, h, wrap){
+  let dx = wx - S.camX, dy = wy - S.camY;
+  if (wrap){ dx = wrapD(dx); dy = wrapD(dy); }
+  const depth = F + S.alt - h; if (depth < F * 0.12) return null;
+  const s = Z * F / depth;
+  return { x: CX + dx * s, y: CY + dy * s, s };
 }
 
-// ---------- draw: the sprite-stacked jet ----------
-function drawJet(cx, cy, yaw, roll, sc){
+// ---------- the live sprite-stacked jet ----------
+function drawJet(cx, cy, yaw, roll, sc, g = ctx){
   const cr = Math.cos(roll), sr = Math.sin(roll);
-  const sx = Math.sign(cr || 1) * Math.max(0.14, Math.abs(cr));   // fake roll: squash slices...
-  const LZ = 1.15 * sc, zc = 3;
-  const cy0 = Math.cos(yaw), sy0 = Math.sin(yaw);
-  const flame = S.thrust ? 4 + Math.random() * 5 : 1 + Math.random();
+  const sx = Math.sign(cr || 1) * Math.max(0.14, Math.abs(cr));
+  const LZ = 1.1 * sc, zc = 3, rx = Math.cos(yaw), ry = Math.sin(yaw);
   for (let k = 0; k < JZ; k++){
-    const z = cr >= 0 ? k : JZ - 1 - k;                // upside down: draw top slice first
-    const o = (z - zc) * LZ;
-    const lx = sr * o, ly = -cr * o;                    // ...and fan them sideways
-    ctx.setTransform(1, 0, 0, 1, cx + lx * cy0 - ly * sy0, cy + lx * sy0 + ly * cy0);
-    ctx.rotate(yaw); ctx.scale(sx * sc, sc);
-    ctx.drawImage(jetLayers[z], -10.5, -12.5);
-    if (z === 3){
-      ctx.fillStyle = '#ff7a1a'; ctx.fillRect(-1.5, 11.5, 3, flame);
-      ctx.fillStyle = '#ffe36b'; ctx.fillRect(-0.5, 11.5, 1, flame * 0.6);
-    }
-  }
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-}
-
-function drawCloudsChase(filter, alpha){
-  for (const cl of clouds){
-    if (!filter(CLOUD_H)) return;
-    const p = proj(cl.x, cl.y, CLOUD_H); if (!p) continue;
-    const m = 60 * p.s;
-    if (p.x < -m || p.x > W + m || p.y < -m || p.y > H + m) continue;
-    const c = Math.cos(S.camA), s0 = Math.sin(S.camA);
-    for (const pass of [0, 1]){
-      ctx.fillStyle = pass ? `rgba(255,255,255,${alpha})` : `rgba(170,190,215,${alpha})`;
-      for (const pf of cl.puffs){
-        const rx = pf.ox * c + pf.oy * s0, ry = -pf.ox * s0 + pf.oy * c;
-        ctx.beginPath(); ctx.arc(p.x + rx * p.s, p.y + ry * p.s + (pass ? 0 : 3 * p.s), pf.r * p.s, 0, 7); ctx.fill();
+    const z = cr >= 0 ? k : JZ - 1 - k, o = (z - zc) * LZ;
+    g.setTransform(1, 0, 0, 1, cx + rx * sr * o, cy + ry * sr * o - cr * o);
+    g.rotate(yaw); g.scale(sx * sc, sc);
+    g.drawImage(jetLayers[z], -JW / 2, -JH / 2);
+    if (z === 2){                                    // twin flames from the nozzles
+      const len = S.thrust ? 5 + Math.random() * 6 : 1.5 + Math.random() * 1.5;
+      for (const fx of [-1.5, 1.5]){
+        g.fillStyle = '#ff6a1f'; g.fillRect(fx - 1, 13, 2, len);
+        g.fillStyle = '#ffd34a'; g.fillRect(fx - 0.5, 13, 1, len * 0.65);
       }
     }
   }
+  if (S.thrust){                                     // additive glow
+    g.setTransform(1, 0, 0, 1, cx, cy); g.rotate(yaw);
+    g.globalCompositeOperation = 'lighter';
+    const gr = g.createRadialGradient(0, 16 * sc, 0, 0, 16 * sc, 9 * sc);
+    gr.addColorStop(0, 'rgba(255,170,60,0.55)'); gr.addColorStop(1, 'rgba(255,90,20,0)');
+    g.fillStyle = gr; g.fillRect(-10 * sc, 6 * sc, 20 * sc, 20 * sc);
+    g.globalCompositeOperation = 'source-over';
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
 }
 
-// ---------- CHASE VIEW ----------
-function renderChase(){
-  const sG = F / (F + S.alt);                      // ground scale
-  const diag = Math.hypot(W, H) / 2;
-  const planetR = PR * sG;
-  const space = planetR < diag * 1.3;
+function drawCloudsOverhead(test, alpha){
+  ctx.globalAlpha = alpha;
+  for (const c of clouds){
+    if (!test(c.h)) continue;
+    const p = proj(c.x, c.y, c.h, true); if (!p) continue;
+    const x = p.x + c.x0 * p.s, y = p.y + (c.y0 - c.zm) * p.s, w = c.w * p.s, h = (c.hh + c.zm) * p.s;
+    if (x > W || y > H || x + w < 0 || y + h < 0) continue;
+    ctx.drawImage(c.top, x, y, w, h);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawTrail(arr, scaleAt){
+  for (let i = 1; i < arr.length; i++){
+    const a = proj(arr[i - 1].x, arr[i - 1].y, arr[i - 1].h, false), b = proj(arr[i].x, arr[i].y, arr[i].h, false);
+    if (!a || !b || Math.abs(arr[i].h - S.alt) > 1500) continue;
+    ctx.strokeStyle = `rgba(245,250,255,${(1 - (S.t - arr[i].t) / 3.5) * 0.9})`;
+    ctx.lineWidth = Math.max(1, a.s * 0.7);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+}
 
+/* =====================================================================
+   OVERHEAD VIEW
+   ===================================================================== */
+function renderOverhead(){
+  const sG = Z * F / (F + S.alt), diag = Math.hypot(W, H) / 2, planetR = PR * sG, space = planetR < diag * 1.3;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#02030a'; ctx.fillRect(0, 0, W, H);
   if (space){
-    const c = Math.cos(-S.camA), s0 = Math.sin(-S.camA);
-    for (const st of stars){
-      const x = CX + (st.u * c - st.v * s0) * diag * 1.1, y = CY + (st.u * s0 + st.v * c) * diag * 1.1;
-      ctx.fillStyle = `rgba(255,255,255,${st.b})`; ctx.fillRect(x | 0, y | 0, 1, 1);
-    }
+    for (const st of stars){ ctx.fillStyle = `rgba(255,255,255,${st.b})`; ctx.fillRect((st.u * W) | 0, (st.v * H) | 0, 1, 1); }
     ctx.save(); ctx.beginPath(); ctx.arc(CX, CY, planetR, 0, 7); ctx.clip();
   }
+  // the baked world, one pattern fill
+  ctx.imageSmoothingEnabled = sG < 0.8;
+  ctx.setTransform(sG, 0, 0, sG, CX - S.camX * sG, CY - S.camY * sG);
+  ctx.fillStyle = overheadPattern;
+  const big = diag / sG + 20; ctx.fillRect(S.camX - big, S.camY - big, big * 2, big * 2);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingEnabled = false;
 
-  // ground: the flat world texture, scaled + rotated (smooth when far away)
-  ctx.imageSmoothingEnabled = sG < 0.6;
-  ctx.setTransform(sG, 0, 0, sG, CX, CY); ctx.rotate(-S.camA); ctx.translate(-S.x, -S.y);
-  ctx.fillStyle = groundPattern;
-  const big = diag / sG + 10; ctx.fillRect(S.x - big, S.y - big, big * 2, big * 2);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.imageSmoothingEnabled = false;
-
-  // wave glints
-  if (sG > 0.5){
-    const step = 24, N = WS / step, R = diag / sG;
-    ctx.fillStyle = 'rgba(225,248,255,0.85)';
-    for (let gx = Math.floor((S.x - R) / step); gx <= Math.ceil((S.x + R) / step); gx++)
-      for (let gy = Math.floor((S.y - R) / step); gy <= Math.ceil((S.y + R) / step); gy++){
-        const gi = ((gx % N) + N) % N, gj = ((gy % N) + N) % N;
-        if (Math.sin(S.t * 1.8 + hash(gi, gj) * 40) < 0.82) continue;
-        const wx = gx * step + hash(gj, gi) * step, wy = gy * step + hash(gi + 7, gj) * step;
-        if (hm[hidx(Math.floor(wx), Math.floor(wy))] !== 0) continue;
-        const p = proj(wx, wy, 0, false); if (p) ctx.fillRect(p.x | 0, p.y | 0, Math.max(1, 3 * sG) | 0, 1);
+  // animated glints on open water
+  if (sG > 0.6){
+    const step = 9, R = diag / sG; ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    for (let gx = Math.floor((S.camX - R) / step); gx <= (S.camX + R) / step; gx++)
+      for (let gy = Math.floor((S.camY - R) / step); gy <= (S.camY + R) / step; gy++){
+        const r1 = hash(gx, gy); if (Math.sin(S.t * 2.2 + r1 * 50) < 0.93) continue;
+        const wx = gx * step + r1 * step, wy = gy * step + hash(gy, gx) * step;
+        if (lvlAt(wx, wy)) continue;
+        const p = proj(wx, wy, 0, false); if (p) ctx.fillRect(p.x | 0, p.y | 0, 1, Math.max(2, 3 * sG) | 0);
       }
   }
-
-  // jet shadow on the sea
-  if (sG > 0.15){
-    const off = Math.min(S.alt * 0.35, 400);
-    const p = proj(S.x + off * 0.6, S.y + off * 0.8, 0, false);
+  // cloud shadows, then the jet's shadow
+  if (sG > 0.12){
+    ctx.globalAlpha = 0.3 * smooth(0.12, 0.4, sG);
+    for (const c of clouds){
+      const p = proj(c.x + SUN[0] * c.h, c.y + SUN[1] * c.h, 0, true); if (!p) continue;
+      const x = p.x + c.x0 * p.s, y = p.y + c.y0 * p.s;
+      if (x > W || y > H || x + c.w * p.s < 0 || y + c.hh * p.s < 0) continue;
+      ctx.drawImage(c.shadow, x, y, c.w * p.s, c.hh * p.s);
+    }
+    const p = proj(S.x + SUN[0] * S.alt, S.y + SUN[1] * S.alt, 0, false);
     if (p){
-      ctx.globalAlpha = 0.28 * smooth(0.15, 0.4, sG);
-      ctx.setTransform(1, 0, 0, 1, p.x, p.y); ctx.rotate(S.a - S.camA); ctx.scale(1.5 * sG * Math.max(0.2, Math.abs(Math.cos(S.roll))), 1.5 * sG);
-      ctx.drawImage(jetShadow, -10.5, -12.5);
-      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
+      ctx.globalAlpha = 0.32 * smooth(0.12, 0.4, sG);
+      const k = JS * p.s / Z;
+      ctx.setTransform(1, 0, 0, 1, p.x, p.y); ctx.rotate(S.a); ctx.scale(k * Math.max(0.2, Math.abs(Math.cos(S.roll))), k);
+      ctx.drawImage(jetSil, -JW / 2, -JH / 2); ctx.setTransform(1, 0, 0, 1, 0, 0);
     }
+    ctx.globalAlpha = 1;
   }
-
-  // SPRITE-STACKED ISLANDS: far ones first, each one bottom slice -> top slice
-  if (sG > 0.25){
-    const vis = [];
-    for (const isl of islands){
-      const p = proj(isl.x, isl.y, 0); if (!p) continue;
-      const m = isl.r * 1.6 * p.s + 40;
-      if (p.x < -m || p.x > W + m || p.y < -m || p.y > H + m * 1.5) continue;
-      vis.push({ isl, ry: p.ry });
-    }
-    vis.sort((a, b) => a.ry - b.ry);
-    for (const { isl } of vis){
-      for (const L of isl.layers){
-        const p = proj(isl.x, isl.y, L.h); if (!p) break;
-        ctx.setTransform(p.s, 0, 0, p.s, p.x, p.y); ctx.rotate(-S.camA);
-        ctx.drawImage(L.c, L.ox, L.oy);
-      }
-    }
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-  }
-
-  // atmosphere haze as you climb
-  const haze = smooth(300, 6000, S.alt) * 0.22;
+  const haze = smooth(3000, 40000, S.alt) * 0.25;
   if (haze > 0){ ctx.fillStyle = `rgba(165,200,255,${haze})`; ctx.fillRect(0, 0, W, H); }
-
   if (space){
     const g = ctx.createRadialGradient(CX, CY, planetR * 0.55, CX, CY, planetR);
     g.addColorStop(0, 'rgba(0,0,20,0)'); g.addColorStop(1, 'rgba(0,0,20,0.65)');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-    ctx.restore();
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.restore();
     const a = ctx.createRadialGradient(CX, CY, planetR * 0.9, CX, CY, planetR * 1.09);
     a.addColorStop(0, 'rgba(120,185,255,0)'); a.addColorStop(0.55, 'rgba(120,185,255,0.75)'); a.addColorStop(1, 'rgba(120,185,255,0)');
     ctx.fillStyle = a; ctx.fillRect(0, 0, W, H);
   }
-
-  // clouds below the jet
-  drawCloudsChase(h => h < S.alt, 0.9);
-
-  // contrail
-  for (const p0 of trail){
-    const p = proj(p0.x, p0.y, p0.h); if (!p) continue;
-    const sz = Math.max(1, (2 + (1.3 - p0.life) * 4) * p.s);
-    ctx.fillStyle = `rgba(235,240,245,${p0.life / 1.3 * 0.7})`;
-    ctx.fillRect(p.x - sz / 2, p.y - sz / 2, sz, sz);
-  }
-
-  // THE JET (always s = 1, at screen centre)
-  drawJet(CX, CY, S.a - S.camA, S.roll, 1.5);
-
-  // clouds between jet and camera, then the fog when you punch through the deck
-  drawCloudsChase(h => h > S.alt && h < S.alt + F * 0.85, 0.5);
-  const fog = 1 - Math.abs(S.alt - CLOUD_H) / 110;
-  if (fog > 0){ ctx.fillStyle = `rgba(240,245,250,${fog * 0.8})`; ctx.fillRect(0, 0, W, H); }
-
-  // day / night tint
+  drawCloudsOverhead(h => h < S.alt, 1);
+  drawTrail(trailL); drawTrail(trailR);
+  const jp = proj(S.x, S.y, S.alt, false);
+  drawJet(jp.x, jp.y, S.a, S.roll, JS);
+  drawCloudsOverhead(h => h >= S.alt, 0.55);
+  let minD = 1e9; for (const c of clouds) if (Math.abs(wrapD(c.x - S.x)) < 40 && Math.abs(wrapD(c.y - S.y)) < 30) minD = Math.min(minD, Math.abs(S.alt - c.h - 15));
+  const fog = 1 - minD / 40; if (fog > 0){ ctx.fillStyle = `rgba(245,248,252,${fog * 0.7})`; ctx.fillRect(0, 0, W, H); }
   let tint = mixc([45, 60, 120], [255, 255, 255], S.day);
-  tint = mixc(tint, [255, 175, 125], S.sunset * 0.45 * (1 - smooth(3000, 9000, S.alt)));
-  ctx.globalCompositeOperation = 'multiply';
-  ctx.fillStyle = rgb(tint); ctx.fillRect(0, 0, W, H);
-  ctx.globalCompositeOperation = 'source-over';
+  tint = mixc(tint, [255, 178, 128], S.sunset * 0.4);
+  if (tint[0] < 254){ ctx.globalCompositeOperation = 'multiply'; ctx.fillStyle = rgb(tint); ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
 }
 
-// ---------- COCKPIT VIEW (Mode 7 floor + painted sky) ----------
-const DAY_TOP = [62, 124, 218], DAY_HOR = [172, 212, 246], NIGHT_TOP = [4, 7, 22], NIGHT_HOR = [24, 34, 72];
-function renderCockpit(){
-  const space = smooth(2500, 9000, S.alt);
-  const hz = Math.round(H * 0.42 + Math.min(45, Math.log1p(S.alt / 200) * 9)); // horizon dips with altitude
-  const FOC = W * 0.55, hc = S.alt + 5;
-  let top = mixc(mixc(NIGHT_TOP, DAY_TOP, S.day), [0, 0, 6], space);
-  let hor = mixc(mixc(NIGHT_HOR, DAY_HOR, S.day), [40, 80, 150], space * 0.7);
-  hor = mixc(hor, [255, 150, 95], S.sunset * 0.6 * (1 - space));
-  const buf = m7buf;
-
-  // sky rows
-  for (let y = 0; y <= hz && y < H; y++){
-    const c = pack(mixc(top, hor, Math.pow(y / hz, 2.2)));
-    buf.fill(c, y * W, y * W + W);
+/* =====================================================================
+   COCKPIT VIEW
+   ===================================================================== */
+const FONT = {'0':'111101101101111','1':'010110010010111','2':'111001111100111','3':'111001111001111','4':'101101111001001',
+  '5':'111100111001111','6':'111100111101111','7':'111001001001001','8':'111101111101111','9':'111101111001111','-':'000000111000000'};
+function num(g, str, x, y, col, s = 1){
+  g.fillStyle = col; str = String(str);
+  for (let i = 0; i < str.length; i++){ const f = FONT[str[i]]; if (!f) continue;
+    for (let b = 0; b < 15; b++) if (f[b] === '1') g.fillRect(x + (i * 4 + b % 3) * s, y + ((b / 3) | 0) * s, s, s); }
+}
+function bevel(g, x, y, w, h, fill, hi = '#5a606b', lo = '#17191d'){
+  g.fillStyle = lo; g.fillRect(x, y, w, h); g.fillStyle = hi; g.fillRect(x, y, w - 1, h - 1);
+  g.fillStyle = fill; g.fillRect(x + 1, y + 1, w - 2, h - 2);
+}
+function buildCockpit(){
+  ov.width = W; ov.height = H; const g = ovc; g.imageSmoothingEnabled = false;
+  const dY = Math.round(H * 0.62);
+  // canopy bow with orange segments
+  g.lineWidth = 15; g.strokeStyle = '#2a2e35';
+  g.beginPath(); g.ellipse(CX, H * 0.96, W * 0.62, H * 0.98, 0, Math.PI, 2 * Math.PI); g.stroke();
+  g.lineWidth = 2; g.strokeStyle = '#4c525c';
+  g.beginPath(); g.ellipse(CX, H * 0.96, W * 0.62 - 7, H * 0.98 - 7, 0, Math.PI, 2 * Math.PI); g.stroke();
+  g.lineWidth = 6; g.strokeStyle = '#e3622a';
+  for (const [a0, a1] of [[1.13, 1.27], [1.73, 1.87]]){ g.beginPath(); g.ellipse(CX, H * 0.96, W * 0.62, H * 0.98, 0, a0 * Math.PI, a1 * Math.PI); g.stroke(); }
+  // glare shield + dash outline
+  g.fillStyle = '#1d2026';
+  g.beginPath(); g.moveTo(0, dY + 8); g.lineTo(W * 0.28, dY + 8); g.lineTo(W * 0.33, dY - 6); g.lineTo(W * 0.67, dY - 6);
+  g.lineTo(W * 0.72, dY + 8); g.lineTo(W, dY + 8); g.lineTo(W, H); g.lineTo(0, H); g.closePath(); g.fill();
+  g.fillStyle = '#30343c'; g.fillRect(0, dY + 14, W, H - dY - 14);
+  g.fillStyle = '#4a505a'; g.fillRect(0, dY + 14, W, 1);
+  // panels
+  const pTop = dY + 20, pH = H - pTop - 22;
+  CK.radar = { x: Math.round(W * 0.05), y: pTop + 4, w: Math.round(W * 0.24), h: pH - 8 };
+  CK.mfd = { x: Math.round(W * 0.71), y: pTop + 4, w: Math.round(W * 0.24), h: pH - 8 };
+  for (const r of [CK.radar, CK.mfd]){ bevel(g, r.x - 5, r.y - 5, r.w + 10, r.h + 10, '#3c4049'); g.fillStyle = '#0b170e'; g.fillRect(r.x, r.y, r.w, r.h); }
+  bevel(g, Math.round(W * 0.31), pTop, Math.round(W * 0.38), pH, '#383c44');
+  CK.adi = { x: CX, y: pTop + pH * 0.48, r: Math.min(30, pH * 0.38) };
+  g.fillStyle = '#8b919a'; g.beginPath(); g.arc(CK.adi.x, CK.adi.y, CK.adi.r + 5, 0, 7); g.fill();
+  g.fillStyle = '#1a1c20'; g.beginPath(); g.arc(CK.adi.x, CK.adi.y, CK.adi.r + 2, 0, 7); g.fill();
+  const gx = W * 0.125; CK.gauges = [];
+  for (const [dx, dy] of [[-1, -0.5], [-1, 0.5], [1, -0.5], [1, 0.5]]){
+    const p = { x: CX + dx * gx * 0.95, y: CK.adi.y + dy * pH * 0.5, r: Math.min(11, pH * 0.17) };
+    g.fillStyle = '#9aa0a8'; g.beginPath(); g.arc(p.x, p.y, p.r + 2, 0, 7); g.fill();
+    g.fillStyle = '#121418'; g.beginPath(); g.arc(p.x, p.y, p.r, 0, 7); g.fill();
+    g.fillStyle = '#d8dde4'; for (let k = 0; k < 8; k++){ const a = Math.PI * 0.75 + k * Math.PI * 1.5 / 7; g.fillRect(p.x + Math.cos(a) * (p.r - 2), p.y + Math.sin(a) * (p.r - 2), 1, 1); }
+    CK.gauges.push(p);
   }
-  // ground rows: each row is a line on the ground at distance d
+  CK.lamps = { x: CX - 26, y: dY - 2 };
+  // stick
+  g.fillStyle = '#1b1d22'; g.fillRect(CX - 5, H - 24, 10, 24);
+  g.fillStyle = '#2b2e34'; g.fillRect(CX - 9, H - 30, 18, 9);
+  g.fillStyle = '#d0482a'; g.fillRect(CX + 3, H - 29, 3, 3);
+  // switches & rivets
+  const sw = ['#e2622a', '#e2622a', '#555b64', '#d9b93a', '#555b64', '#e2622a'];
+  for (let i = 0; i < sw.length; i++){ g.fillStyle = sw[i]; g.fillRect(8 + (i % 3) * 12, H - 18 + ((i / 3) | 0) * 8, 9, 5); }
+  for (let i = 0; i < 3; i++){ g.fillStyle = '#555b64'; g.fillRect(W - 44 + i * 12, H - 16, 9, 9); }
+  g.fillStyle = '#6a707a'; for (let x = 6; x < W; x += 22){ g.fillRect(x, dY + 17, 1, 1); g.fillRect(x, H - 3, 1, 1); }
+  // diagonal glare streaks
+  g.fillStyle = 'rgba(255,255,255,0.05)';
+  for (const sx of [0.62, 0.74]){ g.beginPath(); g.moveTo(W * sx, 0); g.lineTo(W * (sx + 0.05), 0); g.lineTo(W * (sx + 0.05) - H * 0.9, H); g.lineTo(W * sx - H * 0.9, H); g.fill(); }
+  CK.dY = dY;
+  CK.radarC = document.createElement('canvas'); CK.radarC.width = Math.ceil(CK.radar.w / 2); CK.radarC.height = Math.ceil(CK.radar.h / 2);
+}
+
+const DAY_TOP = [70, 140, 228], DAY_HOR = [190, 226, 250], NIGHT_TOP = [4, 7, 22], NIGHT_HOR = [24, 34, 72];
+function renderCockpit(){
+  const space = smooth(15000, 50000, S.alt);
+  const FOC = W * 0.6, hc = 10 + S.alt * K7;
+  const hz = Math.round(H * 0.38 + Math.tan(S.pitch) * FOC + Math.min(30, Math.log1p(S.alt / 3000) * 8));
+  let top = mixc(mixc(NIGHT_TOP, DAY_TOP, S.day), [0, 0, 6], space);
+  let hor = mixc(mixc(NIGHT_HOR, DAY_HOR, S.day), [60, 110, 190], space * 0.6);
+  hor = mixc(hor, [255, 160, 100], S.sunset * 0.55 * (1 - space));
+  const buf = m7buf;
+  for (let y = 0; y < Math.min(H, Math.max(0, hz + 1)); y++){
+    buf.fill(pack(mixc(top, hor, Math.pow(clamp(y / Math.max(1, hz), 0, 1), 2.2))), y * W, y * W + W);
+  }
   const fx = Math.sin(S.a), fy = -Math.cos(S.a), rx = Math.cos(S.a), ry = Math.sin(S.a);
-  const fogD = 900 + S.alt * 14;
-  const light = mixc([0.3, 0.38, 0.6], [1, 1, 1], S.day);
+  const fogD = 2500 + hc * 10, light = mixc([0.3, 0.38, 0.6], [1, 1, 1], S.day);
   const hr = hor[0], hg = hor[1], hb = hor[2];
-  for (let y = hz + 1; y < H; y++){
+  for (let y = Math.max(0, hz + 1); y < H; y++){
     const d = hc * FOC / (y - hz);
     const fog = Math.pow(Math.min(1, d / fogD), 0.7), inv = 1 - fog;
     let wx = S.x + fx * d - rx * d * CX / FOC, wy = S.y + fy * d - ry * d * CX / FOC;
     const sx = rx * d / FOC, sy = ry * d / FOC;
-    let i = y * W;
-    for (let x = 0; x < W; x++, wx += sx, wy += sy, i++){
-      const tx = (((wx | 0) % WS) + WS) % WS, ty = (((wy | 0) % WS) + WS) % WS;
-      const c = t32[ty * WS + tx];
-      const r = (c & 255) * light[0] * inv + hr * fog;
-      const g = (c >> 8 & 255) * light[1] * inv + hg * fog;
-      const b = (c >> 16 & 255) * light[2] * inv + hb * fog;
-      buf[i] = (255 << 24) | (b << 16) | (g << 8) | r;
+    for (let x = 0, i = y * W; x < W; x++, i++, wx += sx, wy += sy){
+      const c = flat32[(((wy | 0) % WS + WS) % WS) * WS + (((wx | 0) % WS + WS) % WS)];
+      buf[i] = (255 << 24) | (((c >> 16 & 255) * light[2] * inv + hb * fog) << 16) | (((c >> 8 & 255) * light[1] * inv + hg * fog) << 8) | ((c & 255) * light[0] * inv + hr * fog);
     }
   }
   m7c.putImageData(m7img, 0, 0);
-
-  // stars, sun, moon on the sky dome
+  // stars, sun, moon
   const starA = Math.max(1 - S.day, space);
   if (starA > 0.02) for (const st of stars){
     const rel = wrapPi(st.az - S.a); if (Math.abs(rel) > 1.2) continue;
@@ -459,51 +577,162 @@ function renderCockpit(){
     if (y >= hz || y < 0) continue;
     m7c.fillStyle = `rgba(255,255,255,${st.b * starA})`; m7c.fillRect(x | 0, y | 0, 1, 1);
   }
-  const body = (az, el, r, col) => {
-    const rel = wrapPi(az - S.a); if (Math.abs(rel) > 1.2 || el < -0.08) return;
-    const x = CX + Math.tan(rel) * FOC, y = hz - Math.tan(el) * FOC;
-    m7c.fillStyle = col; m7c.beginPath(); m7c.arc(x, y, r, 0, 7); m7c.fill();
-  };
-  body(0.6, S.sunEl * 1.1, 7, rgb(mixc([255, 244, 200], [255, 140, 70], S.sunset)));
-  body(0.6 + Math.PI, -S.sunEl * 1.1, 5, 'rgba(225,230,240,0.95)');
-
-  // compose with roll (the whole world rotates around the nose)
+  const body = (az, el, r, col) => { const rel = wrapPi(az - S.a); if (Math.abs(rel) > 1.2 || el < -0.08) return;
+    m7c.fillStyle = col; m7c.beginPath(); m7c.arc(CX + Math.tan(rel) * FOC, hz - Math.tan(el) * FOC, r, 0, 7); m7c.fill(); };
+  body(0.6, S.sunEl * 1.1, 8, rgb(mixc([255, 246, 205], [255, 140, 70], S.sunset)));
+  body(0.6 + Math.PI, -S.sunEl * 1.1, 6, 'rgba(225,230,240,0.95)');
+  // clouds as distance-scaled billboards, far to near
+  const vis = [];
+  for (const c of clouds){
+    const dx = wrapD(c.x - S.x), dy = wrapD(c.y - S.y), f = dx * fx + dy * fy;
+    if (f < 25) continue; vis.push({ c, f, l: dx * rx + dy * ry });
+  }
+  vis.sort((a, b) => b.f - a.f);
+  for (const v of vis){
+    const s = FOC / v.f, w = v.c.w * s, h = v.c.bb.height * s;
+    const yBase = hz - (v.c.h * K7 - hc) * s, x = CX + v.l * s - w / 2;
+    if (x > W || x + w < 0 || yBase < 0 || yBase - h > H) continue;
+    m7c.globalAlpha = 1 - Math.pow(Math.min(1, v.f / fogD), 0.7);
+    m7c.drawImage(v.c.bb, x, yBase - h, w, h);
+  }
+  m7c.globalAlpha = 1;
+  // compose with roll
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.setTransform(1, 0, 0, 1, CX, H * 0.38); ctx.rotate(-S.roll); ctx.scale(1.35, 1.35);
+  ctx.drawImage(m7, -CX, -H * 0.38);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-  ctx.setTransform(1, 0, 0, 1, CX, H * 0.5); ctx.rotate(-S.roll); ctx.scale(1.3, 1.3);
-  ctx.drawImage(m7, -CX, -H * 0.5);
+  let minD = 1e9; for (const c of clouds) if (Math.abs(wrapD(c.x - S.x)) < 40 && Math.abs(wrapD(c.y - S.y)) < 30) minD = Math.min(minD, Math.abs(S.alt - c.h - 15));
+  const fog = 1 - minD / 40; if (fog > 0){ ctx.fillStyle = `rgba(245,248,252,${fog * 0.85})`; ctx.fillRect(0, 0, W, H); }
+  drawHUD();
+  ctx.drawImage(ov, 0, 0);
+  drawInstruments();
+}
+
+function drawHUD(){
+  const G = 'rgba(125,255,154,0.9)', hx = CX - W * 0.2, hy = H * 0.07, hw = W * 0.4, hh = H * 0.46;
+  ctx.save(); ctx.beginPath(); ctx.rect(hx, hy, hw, hh); ctx.clip();
+  ctx.fillStyle = 'rgba(160,220,255,0.06)'; ctx.fillRect(hx, hy, hw, hh);
+  ctx.strokeStyle = 'rgba(200,235,255,0.35)'; ctx.lineWidth = 1; ctx.strokeRect(hx + 0.5, hy + 0.5, hw - 1, hh - 1);
+  const cyH = hy + hh * 0.48;
+  // pitch ladder (rolls with the jet)
+  ctx.translate(CX, cyH); ctx.rotate(-S.roll); ctx.fillStyle = G;
+  const pd = S.pitch * 180 / Math.PI, PX = 3.2;
+  for (let deg = -40; deg <= 40; deg += 10){
+    const y = Math.round((pd - deg) * PX); if (Math.abs(y) > hh) continue;
+    if (deg === 0){ ctx.fillRect(-hw * 0.42, y, hw * 0.3, 1); ctx.fillRect(hw * 0.12, y, hw * 0.3, 1); continue; }
+    for (let x = 18; x < 40; x += deg < 0 ? 4 : 1){ ctx.fillRect(x, y, deg < 0 ? 2 : 1, 1); ctx.fillRect(-x - 1, y, deg < 0 ? 2 : 1, 1); }
+    ctx.fillRect(39, y + (deg > 0 ? 1 : -3), 1, 3); ctx.fillRect(-40, y + (deg > 0 ? 1 : -3), 1, 3);
+  }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // boresight
+  ctx.fillStyle = G;
+  ctx.fillRect(CX - 10, cyH - 10, 4, 1); ctx.fillRect(CX - 10, cyH - 10, 1, 4); ctx.fillRect(CX + 7, cyH - 10, 4, 1); ctx.fillRect(CX + 10, cyH - 10, 1, 4);
+  ctx.fillRect(CX - 10, cyH + 10, 4, 1); ctx.fillRect(CX - 10, cyH + 7, 1, 4); ctx.fillRect(CX + 7, cyH + 10, 4, 1); ctx.fillRect(CX + 10, cyH + 7, 1, 4);
+  ctx.fillRect(CX - 3, cyH, 7, 1); ctx.fillRect(CX, cyH - 3, 1, 7);
+  // speed & altitude tapes
+  const spd = Math.round(S.speed * 3.2), alt = Math.round(S.alt * 11);
+  for (const [x, val, dir] of [[hx + 14, spd, 1], [hx + hw - 15, alt / 20, -1]]){
+    ctx.fillRect(x, hy + 22, 1, hh - 44);
+    const off = (val % 10) * 1.6;
+    for (let y = hy + 22 + off; y < hy + hh - 22; y += 16) ctx.fillRect(x + (dir > 0 ? 1 : -4), y | 0, 4, 1);
+  }
+  num(ctx, spd, hx + 6, hy + 8, G); const as = String(alt); num(ctx, as, hx + hw - 6 - as.length * 4, hy + 8, G);
+  const hd = String(Math.round(((S.a * 180 / Math.PI) % 360 + 360) % 360)).padStart(3, '0');
+  num(ctx, hd, CX - 6, hy + hh - 12, G);
+  ctx.fillRect(CX - 40, hy + hh - 16, 80, 1);
+  for (let k = -4; k <= 4; k++){ const x = CX + k * 10 - ((S.a * 180 / Math.PI) % 10 + 10) % 10; ctx.fillRect(x | 0, hy + hh - 19, 1, 3); }
+  ctx.restore();
+}
 
-  const fog = 1 - Math.abs(S.alt - CLOUD_H) / 110;
-  if (fog > 0){ ctx.fillStyle = `rgba(240,245,250,${fog * 0.85})`; ctx.fillRect(0, 0, W, H); }
-
-  // canopy frame + dash
-  ctx.strokeStyle = '#151a20'; ctx.lineWidth = 6;
-  ctx.beginPath(); ctx.moveTo(-4, H - 30); ctx.lineTo(W * 0.2, -4); ctx.moveTo(W + 4, H - 30); ctx.lineTo(W * 0.8, -4); ctx.stroke();
-  ctx.fillStyle = '#151a20'; ctx.fillRect(0, H - 30, W, 30);
-  ctx.fillStyle = '#232a33'; ctx.fillRect(CX - 60, H - 26, 120, 22);
-  ctx.fillStyle = S.thrust ? '#ff9a3a' : '#3a4450'; ctx.fillRect(CX - 54, H - 20, 10, 10);
-  // HUD waterline
-  ctx.fillStyle = '#7fffb0';
-  ctx.fillRect(CX - 12, H * 0.5, 8, 1); ctx.fillRect(CX + 5, H * 0.5, 8, 1); ctx.fillRect(CX, H * 0.5 - 1, 1, 3);
+function drawInstruments(){
+  const t = S.t;
+  // radar: heading-up map from the level grid + sweep
+  const r = CK.radar, rc = CK.radarC, rg = rc.getContext('2d'), rw = rc.width, rh = rc.height;
+  const im = rg.createImageData(rw, rh), b = new Uint32Array(im.data.buffer);
+  const range = 14, ca = Math.cos(S.a), sa = Math.sin(S.a);
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++){
+    const lx = (x - rw / 2) * range, ly = (y - rh * 0.7) * range;
+    const wx = S.x + lx * ca - ly * sa, wy = S.y + lx * sa + ly * ca;
+    const L = lvlAt(wx, wy);
+    b[y * rw + x] = L ? pack(L > 6 ? [110, 255, 140] : [60, 200, 90]) : pack([10, 28, 14]);
+  }
+  rg.putImageData(im, 0, 0);
+  ctx.drawImage(rc, r.x, r.y, rw * 2, rh * 2);
+  ctx.save(); ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  const ox = r.x + r.w / 2, oy = r.y + r.h * 0.7;
+  ctx.strokeStyle = 'rgba(125,255,154,0.35)'; ctx.lineWidth = 1;
+  for (const rr of [r.h * 0.3, r.h * 0.6]){ ctx.beginPath(); ctx.arc(ox, oy, rr, 0, 7); ctx.stroke(); }
+  const sw = t * 2.2; ctx.strokeStyle = 'rgba(180,255,200,0.9)';
+  ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + Math.cos(sw) * r.w, oy + Math.sin(sw) * r.w); ctx.stroke();
+  ctx.fillStyle = '#eaffef'; ctx.fillRect(ox - 1, oy - 1, 3, 3);
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; for (let y = r.y; y < r.y + r.h; y += 2) ctx.fillRect(r.x, y, r.w, 1);
+  ctx.restore();
+  // attitude indicator
+  const a = CK.adi;
+  ctx.save(); ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, 7); ctx.clip();
+  ctx.translate(a.x, a.y); ctx.rotate(-S.roll); ctx.translate(0, S.pitch * a.r * 1.6);
+  ctx.fillStyle = '#5e9ee6'; ctx.fillRect(-a.r * 2, -a.r * 3, a.r * 4, a.r * 3);
+  ctx.fillStyle = '#9a6234'; ctx.fillRect(-a.r * 2, 0, a.r * 4, a.r * 3);
+  ctx.fillStyle = '#fff'; ctx.fillRect(-a.r * 2, 0, a.r * 4, 1);
+  for (let k = -3; k <= 3; k++) if (k) ctx.fillRect(-(k % 2 ? 6 : 10), -k * 8, k % 2 ? 12 : 20, 1);
+  ctx.restore();
+  ctx.fillStyle = '#ffcf3a'; ctx.fillRect(a.x - 14, a.y, 9, 2); ctx.fillRect(a.x + 6, a.y, 9, 2); ctx.fillRect(a.x - 1, a.y - 1, 3, 3);
+  ctx.fillStyle = '#e3622a'; ctx.fillRect(a.x - 1, a.y - a.r - 4, 3, 3);
+  // gauges: speed, thrust, climb, altitude
+  const vals = [S.speed / 260, S.thrust ? 0.95 : 0.35, 0.5 + clamp(S.vz / 800, -0.5, 0.5), (S.alt % 1000) / 1000];
+  CK.gauges.forEach((p, i) => {
+    const ang = Math.PI * 0.75 + clamp(vals[i], 0, 1) * Math.PI * 1.5;
+    ctx.strokeStyle = '#ff7a3a'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + Math.cos(ang) * (p.r - 2), p.y + Math.sin(ang) * (p.r - 2)); ctx.stroke();
+  });
+  // throttle lamps
+  for (let i = 0; i < 5; i++){ ctx.fillStyle = S.thrust || i < 2 ? '#ff8a2a' : '#5a2a14'; ctx.fillRect(CK.lamps.x + i * 11, CK.lamps.y, 9, 4); }
+  // right MFD: jet icon + numbers + bars
+  const m = CK.mfd, G = '#7dff9a';
+  ctx.save(); ctx.beginPath(); ctx.rect(m.x, m.y, m.w, m.h); ctx.clip();
+  num(ctx, Math.round(S.alt * 11), m.x + 5, m.y + 5, G);
+  num(ctx, Math.round(S.speed * 3.2), m.x + 5, m.y + m.h - 10, G);
+  ctx.setTransform(1, 0, 0, 1, m.x + m.w * 0.42, m.y + m.h * 0.55);
+  const k = Math.min(1.4, m.h / 30); ctx.scale(k, k); ctx.drawImage(jetSilG, -JW / 2, -JH / 2);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  for (let i = 0; i < 2; i++){
+    const bx = m.x + m.w - 18 + i * 8, v = i ? S.speed / 260 : clamp(S.alt / 20000, 0, 1);
+    ctx.strokeStyle = G; ctx.strokeRect(bx + 0.5, m.y + 6.5, 5, m.h - 13);
+    ctx.fillStyle = G; const fh = (m.h - 15) * v; ctx.fillRect(bx + 2, m.y + m.h - 8 - fh, 2, fh);
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; for (let y = m.y; y < m.y + m.h; y += 2) ctx.fillRect(m.x, y, m.w, 1);
+  ctx.restore();
 }
 
 // ---------- loop ----------
-let last = performance.now(), hudT = 0;
+let last = 0, uiT = 0;
 function frame(now){
-  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const dt = Math.min(0.05, (now - last) / 1000 || 0); last = now;
   update(dt);
   ctx.imageSmoothingEnabled = false;
-  if (S.view === 'chase') renderChase(); else renderCockpit();
-  hudT -= dt;
-  if (hudT <= 0){
-    hudT = 0.1;
-    hud.innerHTML = `ALT <b>${Math.round(S.alt * 3)} ft</b> &nbsp; SPD <b>${Math.round(S.speed * 4)} kt</b><br>` +
-      `steer: pointer / A D · click: roll · hold / Space: thrust & climb · C: camera`;
+  if (S.view === 'overhead') renderOverhead(); else renderCockpit();
+  if ((uiT -= dt) <= 0){
+    uiT = 0.15;
+    hintEl.textContent = S.view === 'overhead'
+      ? 'Move to steer · click to roll · hold to fire the thrusters · space for cockpit view'
+      : 'Point to turn, climb and dive · click to roll · hold to fire the thrusters · space for overhead';
+    altEl.textContent = S.view === 'overhead' ? `ALT ${Math.round(S.alt * 11)} FT` : '';
   }
   requestAnimationFrame(frame);
 }
-requestAnimationFrame(frame);
+setTimeout(() => {
+  buildWorld(); buildClouds(); resize(); addEventListener('resize', resize);
+  // start just off the coast of the biggest nearby island
+  let best = null;
+  for (let i = 0; i < 4000 && !best; i++){
+    const x = rnd() * WS, y = rnd() * WS;
+    if (lvlAt(x, y) >= 6 && !lvlAt(x + 160, y + 220)) best = [x + 160, y + 220];
+  }
+  if (best){ S.x = best[0]; S.y = best[1]; }
+  S.camX = S.x; S.camY = S.y; S.a = -0.5;
+  document.getElementById('loading').remove();
+  requestAnimationFrame(t => { last = t; frame(t); });
+}, 30);
 </script>
 </body>
 </html>
